@@ -144,6 +144,7 @@ def test_pg_version_string_to_number():
 def test_extract_pg_command_version_string():
     assert extract_pg_command_version_string("pg_basebackup (PostgreSQL) 9.3.20") == "9.3.20"
     assert extract_pg_command_version_string("pg_basebackup (PostgreSQL) 10devel") == "10"
+    assert extract_pg_command_version_string("pg_basebackup (PostgreSQL) 18rc1") == "18"
 
 
 def test_command_version_to_number():

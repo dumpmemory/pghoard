@@ -280,7 +280,7 @@ def extract_pg_command_version_string(command_version_string: str) -> str:
     """
     match = re.search(r" \(PostgreSQL\) ([0-9]+(?:\.[0-9]+)+)", command_version_string)
     if not match:
-        match = re.search(r" \(PostgreSQL\) ([0-9]+)((beta([0-9]))|(devel))", command_version_string)
+        match = re.search(r" \(PostgreSQL\) ([0-9]+)((beta([0-9]))|(devel)|(rc[0-9]))", command_version_string)
         if not match:
             raise Error("Unrecognized PostgreSQL version string {!r}".format(command_version_string))
     return match.group(1)
