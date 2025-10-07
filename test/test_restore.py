@@ -103,6 +103,11 @@ class TestRecoveryConf(PGHoardTestCase):
         recovery_time = recovery_time.replace(tzinfo=datetime.timezone.utc)
         assert r._find_nearest_basebackup(recovery_time)["name"] == "2015-02-12_0"  # pylint: disable=protected-access
 
+        # for each basebackup, make sure we find it when asking for its exact time
+        for basebackup in basebackups:
+            recovery_time = datetime.datetime.fromisoformat(basebackup["metadata"]["start-time"])
+            assert r._find_nearest_basebackup(recovery_time)["name"] == basebackup["name"]  # pylint: disable=protected-access
+
     def test_compatible_cli_args(self):
         parser = Restore().create_parser()
 
