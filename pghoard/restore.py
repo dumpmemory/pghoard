@@ -372,7 +372,7 @@ class Restore:
                     backup_ts = dates.parse_timestamp(basebackup["metadata"]["end-time"])
                 else:
                     backup_ts = dates.parse_timestamp(basebackup["metadata"]["start-time"])
-                if backup_ts >= recovery_target_time:
+                if backup_ts > recovery_target_time:
                     continue
             applicable_basebackups.append(basebackup)
 
