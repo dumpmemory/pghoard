@@ -726,6 +726,11 @@ class PGHoard:
         if not site_config["active"]:
             return  # If a site has been marked inactive, don't bother checking anything
 
+        # Stop any existing receivexlog threads if we're in basic mode
+        if site_config["active_backup_mode"] == "basic":
+            for t in self.receivexlogs.values():
+                t.running = False
+
         self._cleanup_inactive_receivexlogs(site)
 
         chosen_backup_node = random.choice(site_config["nodes"])
