@@ -20,15 +20,6 @@ from . import version
 PGHOARD_HOST = "127.0.0.1"
 PGHOARD_PORT = 16000
 
-# When running restore_command PostgreSQL interprets exit codes 1..125 as "file not found errors" signalling
-# that there's no such WAL file from which PostgreSQL assumes that we've completed recovery.  We never want to
-# return such an error code unless we actually got confirmation that the requested file isn't in the backend so
-# we try to exit with EXIT_ERROR (255) status whenever we see unexpected errors.  Such an error code causes
-# PostgreSQL to abort recovery and wait for admin interaction.
-#
-# The above considerations apply to handling archive_command, but in its case there's no reason for us to ask
-# PostgreSQL to abort, we want it to just retry indefinitely so we'll always return a code between 1..125.
-#
 # Note that EXIT_NOT_FOUND and EXIT_ARCHIVE_FAIL and their error codes are not defined or required by
 # PostgreSQL, they're just used for convenience here and to test for differences between various failure
 # scenarios (Python exits with status 1 on uncaught exceptions.)
@@ -37,7 +28,7 @@ EXIT_FAIL = 1
 EXIT_UNEXPECTED = 2
 EXIT_ARCHIVE_FAIL = 3
 EXIT_NOT_FOUND = 4
-EXIT_ABORT = 255
+EXIT_ABORT = 5
 
 
 class PGCError(Exception):
