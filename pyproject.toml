@@ -49,7 +49,7 @@ dev = [
     "pytest-mock",
     "pytest-timeout",
     "pytest-xdist",
-    "yapf==0.30.0",
+    "yapf==0.43.0",
     "isort==5.7.0",
     "coverage",
     "coveralls",

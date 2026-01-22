@@ -466,7 +466,10 @@ class Restore:
     ):
         targets = [recovery_target_name, recovery_target_time, recovery_target_xid]
         if sum(0 if flag is None else 1 for flag in targets) > 1:
-            raise RestoreError("Specify at most one of recovery_target_name, " "recovery_target_time or recovery_target_xid")
+            raise RestoreError(
+                "Specify at most one of recovery_target_name, "
+                "recovery_target_time or recovery_target_xid"
+            )
 
         # If basebackup that we want it set as latest, figure out which one it is
         if recovery_target_time:
