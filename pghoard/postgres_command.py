@@ -118,8 +118,6 @@ def main(args=None):
     parser.add_argument("--output", type=str, help="output file")
     parser.add_argument("--mode", type=str, required=True, choices=["archive", "restore"], help="operation mode")
 
-    # Note that we try to catch as many exception as possible and to exit with return code 255 unless we get a
-    # custom exception stating otherwise.  This is to avoid signalling "end of recovery" to PostgreSQL.
     fail_exit_code = EXIT_ABORT
     try:
         pa = parser.parse_args(args)

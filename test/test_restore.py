@@ -179,6 +179,12 @@ class TestRecoveryConf(PGHoardTestCase):
         content = create_recovery_conf(td, "dummysite", recovery_target_action="promote", recovery_target_xid="42")
         assert "pause_at_recovery_target" not in content
 
+        # test passing custom pghoard_postgres_command binary
+        content = create_recovery_conf(td, "dummysite")
+        assert "restore_command = 'pghoard_postgres_command " in content
+        content = create_recovery_conf(td, "dummysite", pghoard_postgres_command_bin="pghoard_postgres_command_go")
+        assert "restore_command = 'pghoard_postgres_command_go " in content
+
 
 class TestBasebackupFetcher(unittest.TestCase):
     def test_progress_tracking_and_error_handling(self):
