@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from io import BytesIO
@@ -469,11 +469,23 @@ class TransferAgent(PGHoardThread):
             storage = self.get_object_storage(site)
             unlink_local = file_to_transfer.remove_after_upload
             self.log.info("Uploading file to object store: src=%r dst=%r", file_to_transfer.source_data, key)
+            file_ctx: Union[nullcontext[BinaryIO], BinaryIO]
+
             if isinstance(file_to_transfer.source_data, (BinaryIO, BytesIO)):
-                f = file_to_transfer.source_data
+                # Do not close external IO objects here,
+                # otherwise retries will fail with a closed file error.
+                # Memory will be automatically freed by GC
+                # once this file_to_transfer object is no longer referenced.
+                file_ctx = nullcontext(file_to_transfer.source_data)
             else:
-                f = open(file_to_transfer.source_data, "rb")
-            with f, track_upload_event(progress_tracker=self.upload_tracker, file_key=key, upload_event=file_to_transfer):
+                file_ctx = open(file_to_transfer.source_data, "rb")
+            with file_ctx as f, \
+                    track_upload_event(
+                        progress_tracker=self.upload_tracker, file_key=key, upload_event=file_to_transfer,
+                    ):
+                # rewind in case of retry
+                if isinstance(file_to_transfer.source_data, (BinaryIO, BytesIO)):
+                    f.seek(0)
                 metadata = file_to_transfer.metadata.copy()
                 if file_to_transfer.file_size is not None:
                     metadata["Content-Length"] = str(file_to_transfer.file_size)

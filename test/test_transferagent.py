@@ -6,8 +6,10 @@ See LICENSE for details
 """
 import os
 import time
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import pytest
@@ -31,14 +33,29 @@ class MockStorage(Mock):
 
 
 class MockStorageRaising(Mock):
+    def __init__(
+        self,
+        *args,
+        max_raises: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.max_raises = max_raises
+        self.retries = 0
+
+    def _raise_storage_error_if_needed(self) -> None:
+        self.retries += 1
+        if self.max_raises is None or self.retries <= self.max_raises:
+            raise StorageError("foo")
+
     def get_contents_to_string(self, key):  # pylint: disable=unused-argument
         return b"joo", {"key": "value"}
 
     def store_file_from_disk(self, key, local_path, metadata, multipart=None):  # pylint: disable=unused-argument
-        raise StorageError("foo")
+        self._raise_storage_error_if_needed()
 
-    def store_file_object(self, key, fd, *, cache_control=None, metadata=None, mimetype=None, upload_progress_fn=None):
-        raise StorageError("foo")
+    def store_file_object(self, key, fd, *, cache_control=None, metadata=None, mimetype=None, upload_progress_fn=None):  # pylint: disable=unused-argument
+        self._raise_storage_error_if_needed()
 
 
 class MockStorageNetworkThrottle(MockStorage):
@@ -340,3 +357,26 @@ class TestTransferAgent(PGHoardTestCase):
         assert updated_progress.progress["total_bytes_uploaded"].current_progress == 3
         if temp_progress_file.exists():
             temp_progress_file.unlink()
+
+    def test_retry_on_byteio_upload(self) -> None:
+        callback_queue = CallbackQueue()
+        storage = MockStorageRaising(max_raises=2)
+        self.transfer_agent.sleep = lambda x: time.sleep(0.0001)
+        self.transfer_agent.get_object_storage = lambda x: storage
+
+        assert os.path.exists(self.foo_path) is True
+
+        self.transfer_queue.put(
+            UploadEvent(
+                callback_queue=callback_queue,
+                file_type=FileType.Wal,
+                file_path=Path(self.foo_path),
+                file_size=100,
+                source_data=BytesIO(b"XXX" * 100),
+                remove_after_upload=False,
+                metadata={"start-wal-segment": "00000001000000000000000C"},
+                backup_site_name=self.test_site
+            )
+        )
+        assert callback_queue.get(timeout=5.0) == CallbackEvent(success=True, payload={"file_size": 100})
+        assert storage.retries == 3
