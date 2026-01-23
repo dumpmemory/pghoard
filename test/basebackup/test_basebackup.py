@@ -5,6 +5,7 @@ Copyright (c) 2015 Ohmu Ltd
 See LICENSE for details
 """
 import datetime
+import json
 import os
 import tarfile
 import time
@@ -24,6 +25,7 @@ from rohmu import dates, get_transfer
 from pghoard import common, metrics
 from pghoard.basebackup.base import PGBaseBackup
 from pghoard.common import (BackupReason, BaseBackupFormat, BaseBackupMode, CallbackEvent, CallbackQueue)
+from pghoard.object_store import BucketObjectStore
 from pghoard.pghoard import DeltaBaseBackupFailureInfo
 from pghoard.restore import Restore, RestoreError
 
@@ -327,9 +329,13 @@ LABEL: pg_basebackup base backup
 
         # there should only be a single backup so lets compare what was in the metadata with what
         # was in the backup label
-        storage_config = common.get_object_storage_config(pghoard.config, pghoard.test_site)
+
+        recover_sites = Restore().find_recovery_sites(pghoard.test_site, pghoard.config_path)
+        recover_site = BucketObjectStore(pghoard.config, recover_sites, None).list_basebackups()[0].site
+
+        storage_config = common.get_object_storage_config(pghoard.config, recover_site)
         storage = get_transfer(storage_config)
-        backups = storage.list_path(os.path.join(pghoard.config["backup_sites"][pghoard.test_site]["prefix"], "basebackup"))
+        backups = storage.list_path(os.path.join(pghoard.config["backup_sites"][recover_site]["prefix"], "basebackup"))
 
         # lets grab the backup label details for what we restored
         pgb = PGBaseBackup(
@@ -376,6 +382,29 @@ LABEL: pg_basebackup base backup
 
     def test_basebackups_basic(self, capsys, db, pghoard, tmpdir):
         self._test_basebackups(capsys, db, pghoard, tmpdir, BaseBackupMode.basic)
+
+    def change_to_new_storage_location(self, pghoard, new_site_name: str, tmpdir) -> None:
+        new_storage = deepcopy(pghoard.config["backup_sites"][pghoard.test_site])
+        new_storage["object_storage"]["directory"] = "/dev/null"
+        new_storage["moved_from"] = [pghoard.test_site]
+        pghoard.config["backup_sites"][new_site_name] = new_storage
+        pghoard.test_site = new_site_name
+
+        confpath = os.path.join(str(tmpdir), "config.json")
+        with open(confpath, "w") as fp:
+            json.dump(pghoard.config, fp)
+
+    def test_basebackups_can_restore_from_old_location(self, capsys, db, pghoard, tmpdir):
+        self._test_create_basebackup(capsys, db, pghoard, BaseBackupMode.basic, replica=False)
+
+        new_site_name = pghoard.test_site + "_new"
+        old_site_name = pghoard.test_site
+        self.change_to_new_storage_location(pghoard, new_site_name, tmpdir)
+
+        assert len(BucketObjectStore(pghoard.config, [new_site_name], None).list_basebackups()) == 0
+        assert len(BucketObjectStore(pghoard.config, [new_site_name, old_site_name], None).list_basebackups()) == 1
+
+        self._test_restore_basebackup(db, pghoard, tmpdir, BaseBackupMode.basic)
 
     def test_basebackups_basic_lzma(self, capsys, db, pghoard_lzma, tmpdir):
         self._test_basebackups(capsys, db, pghoard_lzma, tmpdir, BaseBackupMode.basic)
@@ -835,6 +864,42 @@ LABEL: pg_basebackup base backup
         assert metadata2["backup-reason"] == BackupReason.requested
         assert metadata2["backup-decision-time"] == now3.isoformat()
         assert metadata2["normalized-backup-time"] == metadata["normalized-backup-time"]
+
+    def test_get_new_backup_details_finds_backup_from_old_site(self, pghoard):
+        """Test that get_new_backup_details considers backups from old site via moved_from."""
+        now = datetime.datetime.now(datetime.timezone.utc).replace(hour=15, minute=20, second=30, microsecond=0)
+
+        old_site = pghoard.test_site
+        new_site = pghoard.test_site + "_new"
+
+        pghoard.set_state_defaults(old_site)
+        old_site_config = pghoard.config["backup_sites"][old_site]
+        pghoard.state["backup_sites"][old_site]["basebackups"].append({
+            "metadata": {
+                "start-time": now - datetime.timedelta(hours=1),
+                "backup-decision-time": now - datetime.timedelta(hours=1),
+                "backup-reason": BackupReason.scheduled,
+                "normalized-backup-time": None,
+            },
+            "name": "old_site_backup_01",
+        })
+
+        new_site_config = deepcopy(old_site_config)
+        new_site_config["moved_from"] = [old_site]
+        new_site_config["basebackup_interval_hours"] = 24
+        pghoard.config["backup_sites"][new_site] = new_site_config
+        pghoard.set_state_defaults(new_site)
+
+        assert len(pghoard.state["backup_sites"][new_site]["basebackups"]) == 0
+
+        metadata = pghoard.get_new_backup_details(now=now, site=new_site, site_config=new_site_config)
+        assert metadata is None, "Should not trigger new backup when recent backup exists on old site"
+
+        new_site_config_no_moved_from = deepcopy(new_site_config)
+        del new_site_config_no_moved_from["moved_from"]
+        metadata = pghoard.get_new_backup_details(now=now, site=new_site, site_config=new_site_config_no_moved_from)
+        assert metadata is not None, "Should trigger new backup when moved_from is not configured"
+        assert metadata["backup-reason"] == BackupReason.scheduled
 
     def test_patch_basebackup_info(self, pghoard):
         now = datetime.datetime.now(datetime.timezone.utc)

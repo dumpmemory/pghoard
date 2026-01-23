@@ -5,6 +5,7 @@ Copyright (c) 2016 Ohmu Ltd
 See LICENSE for details
 """
 import argparse
+import copy
 import datetime
 import io
 import json
@@ -824,12 +825,17 @@ class PGHoard:
         be created at this time"""
         if not now:
             now = datetime.datetime.now(datetime.timezone.utc)
-        basebackups = self.state["backup_sites"][site]["basebackups"]
+        basebackups = copy.deepcopy(self.state["backup_sites"][site]["basebackups"])
+
+        for older_site in reversed(site_config.get("moved_from", [])):
+            basebackups += copy.deepcopy(self.state["backup_sites"].get(older_site, {}).get("basebackups", []))
+
+        basebackups = sorted(basebackups, key=lambda d: d["metadata"]["start-time"])
+
         backup_hour = site_config.get("basebackup_hour")
         backup_minute = site_config.get("basebackup_minute")
         backup_reason = None
         normalized_backup_time = self.get_normalized_backup_time(site_config, now=now)
-
         if site in self.requested_basebackup_sites:
             self.log.info("Creating a new basebackup for %r due to request", site)
             self.requested_basebackup_sites.discard(site)
@@ -887,6 +893,8 @@ class PGHoard:
             "backup-reason": backup_reason,
             # The closest backup schedule time this backup matches to (if schedule has been defined)
             "normalized-backup-time": normalized_backup_time,
+            # Site information of backup location
+            "site": site
         }
 
     def run(self):
