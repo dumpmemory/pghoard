@@ -20,7 +20,9 @@ def is_basebackup_preserved(basebackup_entry: Mapping[str, Any], now: datetime.d
     return preserve_until is not None and preserve_until > now
 
 
-def parse_preservation_requests(preservation_requests: Sequence[Mapping[str, Any]], ) -> Mapping[str, datetime.datetime]:
+def parse_preservation_requests(
+    preservation_requests: Sequence[Mapping[str, Any]],
+) -> Mapping[str, datetime.datetime]:
     backups_to_preserve: dict[str, datetime.datetime] = {}
     for preservation_request in preservation_requests:
         backup_name = preservation_request["metadata"]["preserve-backup"]

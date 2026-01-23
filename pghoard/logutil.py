@@ -11,9 +11,10 @@ import logging.handlers
 import os
 
 try:
-    from systemd import daemon  # pylint: disable=no-name-in-module
+    from systemd import daemon, journal  # pylint: disable=no-name-in-module
 except ImportError:
     daemon = None
+    journal = None
 
 LOG_FORMAT = "%(asctime)s\t%(name)s\t%(threadName)s\t%(levelname)s\t%(message)s"
 LOG_FORMAT_SHORT = "%(levelname)s\t%(message)s"
@@ -31,9 +32,19 @@ def set_syslog_handler(address, facility, logger):
 def configure_logging(level=logging.DEBUG, short_log=False):
     # Are we running under systemd?
     if os.getenv("NOTIFY_SOCKET"):
-        logging.basicConfig(level=level, format=LOG_FORMAT_SYSLOG)
-        if not daemon:
-            print("WARNING: Running under systemd but python-systemd not available, " "systemd won't see our notifications")
+        if journal:
+            handler = journal.JournalHandler()
+            handler.setFormatter(logging.Formatter(LOG_FORMAT_SYSLOG))
+            root_logger = logging.getLogger()
+            root_logger.addHandler(handler)
+            root_logger.setLevel(level)
+        else:
+            logging.basicConfig(level=level, format=LOG_FORMAT_SYSLOG)
+            if not daemon:
+                print(
+                    "WARNING: Running under systemd but python-systemd not available, "
+                    "systemd won't see our notifications"
+                )
     else:
         logging.basicConfig(level=level, format=LOG_FORMAT_SHORT if short_log else LOG_FORMAT)
 
