@@ -43,6 +43,7 @@ from .postgres_command import PGHOARD_HOST, PGHOARD_PORT
 
 STALL_MIN_RETRIES = 6  # minimum retry for stalled download, for the whole basebackup restore
 SINGLE_FILE_MAX_RETRIES = 6  # maximum retry for a single file
+DEFAULT_PGHOARD_POSTGRES_COMMAND_BIN = "pghoard_postgres_command"
 
 
 class RestoreError(Error):
@@ -92,6 +93,7 @@ def create_recovery_conf(
     dirpath,
     site,
     *,
+    pghoard_postgres_command_bin=DEFAULT_PGHOARD_POSTGRES_COMMAND_BIN,
     port=PGHOARD_PORT,
     webserver_username=None,
     webserver_password=None,
@@ -104,7 +106,7 @@ def create_recovery_conf(
     restore_to_primary=None
 ):
     restore_command = [
-        "pghoard_postgres_command",
+        pghoard_postgres_command_bin,
         "--mode",
         "restore",
         "--port",
@@ -276,6 +278,11 @@ class Restore:
                 dest="cancel_preserve_on_success",
                 action="store_false",
             )
+            cmd.add_argument(
+                "--pghoard-postgres-command-bin",
+                help="pghoard_postgres_command binary",
+                default=DEFAULT_PGHOARD_POSTGRES_COMMAND_BIN
+            )
 
         cmd = add_cmd(self.list_basebackups_http)
         host_port_user_args()
@@ -342,6 +349,7 @@ class Restore:
                 tablespace_base_dir=arg.tablespace_base_dir,
                 preserve_until=arg.preserve_until,
                 cancel_preserve_on_success=arg.cancel_preserve_on_success,
+                pghoard_postgres_command_bin=arg.pghoard_postgres_command_bin,
             )
         except RestoreError:  # pylint: disable=try-except-raise
             # Pass RestoreErrors thru
@@ -463,6 +471,7 @@ class Restore:
         tablespace_base_dir=None,
         preserve_until: Optional[str] = None,
         cancel_preserve_on_success: bool = True,
+        pghoard_postgres_command_bin: str = DEFAULT_PGHOARD_POSTGRES_COMMAND_BIN
     ):
         targets = [recovery_target_name, recovery_target_time, recovery_target_xid]
         if sum(0 if flag is None else 1 for flag in targets) > 1:
@@ -628,6 +637,7 @@ class Restore:
         create_recovery_conf(
             dirpath=pgdata,
             site=site,
+            pghoard_postgres_command_bin=pghoard_postgres_command_bin,
             port=self.config["http_port"],
             webserver_username=self.config.get("webserver_username"),
             webserver_password=self.config.get("webserver_password"),
