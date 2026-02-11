@@ -406,7 +406,7 @@ class PGHoard:
         delta_backup_names = {
             backup.name: backup.data["metadata"]
             for backup in backups_to_keep
-            if backup.data["metadata"]["format"] in delta_formats
+            if backup.data["metadata"]["format"] in delta_formats and backup.site == site
         }
         delta_backup_names[basebackup_name_to_delete] = metadata
 
@@ -635,11 +635,13 @@ class PGHoard:
                 bb_tbd_site,
                 basebackup_to_be_deleted.name,
                 basebackup_to_be_deleted.data["metadata"],
-                basebackups=chained_basebackups
+                # just provide backups from the basebackup_to_be_deleted's site
+                basebackups=[cb for cb in chained_basebackups if cb.site == bb_tbd_site],
             )
 
         all_chained_sites = [site] + site_config.get("moved_from", [])
         for c_site in all_chained_sites:
+            self.set_state_defaults(c_site)
             self.state["backup_sites"][c_site]["basebackups"] = [bb.data for bb in chained_basebackups if bb.site == c_site]
 
     def get_normalized_backup_time(self, site_config, *, now=None):

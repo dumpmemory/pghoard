@@ -710,7 +710,7 @@ dbname|"""
             wal_storage_path=os.path.join(_get_site_dir(self.test_site), "xlog"),
             backups_and_wals={
                 "2026-02-11_2": ["000000010000000A00000000A", "000000010000000A0000000B"],
-                "2026-02-11_3": ["000000010000000A00000000A", "000000010000000A0000000B"],
+                "2026-02-11_3": ["000000010000000A00000000C", "000000010000000A0000000D"],
             },
         )
         self.pghoard.refresh_backup_list_and_delete_old(self.test_site)
