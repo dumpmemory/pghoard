@@ -7,7 +7,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from requests import Session
 from requests.auth import HTTPBasicAuth
@@ -17,14 +17,14 @@ from pghoard import common
 
 
 class BaseBackupInfo:
-    def __init__(self, name: str, site: str, data: dict[str, Any]):
+    def __init__(self, name: str, site: str, data: Dict[str, Any]):
         self.name = name
         self.data = data
         self.site = site
 
 
 class BaseBackupInfoFromBucket(BaseBackupInfo):
-    def __init__(self, name: str, site: str, prefix: str, storage: BaseTransfer[Any], data: dict[str, Any]):
+    def __init__(self, name: str, site: str, prefix: str, storage: BaseTransfer[Any], data: Dict[str, Any]):
         super().__init__(data=data, name=name, site=site)
         self.storage = storage
         self.prefix = prefix

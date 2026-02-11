@@ -32,6 +32,7 @@ from pghoard.common import (
     FileTypePrefixes, PersistedProgress, download_backup_meta_file, extract_pghoard_delta_metadata
 )
 from pghoard.metrics import Metrics
+from pghoard.object_store import BaseBackupInfo
 from pghoard.transfer import TransferQueue, UploadEvent
 
 
@@ -64,7 +65,7 @@ class DeltaBaseBackup:
         metrics: Metrics,
         encryption_data: EncryptionData,
         compression_data: CompressionData,
-        get_remote_basebackups_info: Callable[[str], List[Dict[str, Any]]],
+        get_remote_basebackups_info: Callable[[str], List[BaseBackupInfo]],
         parallel: int,
         temp_base_dir: Path,
         compressed_base: Path,
@@ -129,13 +130,14 @@ class DeltaBaseBackup:
         """Iterate through all manifest files and fetch information about hash files"""
         all_snapshot_files: Dict[str, SnapshotFile] = {}
         for backup in self.get_remote_basebackups_info(self.site):
-            if backup["metadata"].get("format") not in {BaseBackupFormat.delta_v1, BaseBackupFormat.delta_v2}:
+            backup_data = backup.data
+            if backup_data["metadata"].get("format") not in {BaseBackupFormat.delta_v1, BaseBackupFormat.delta_v2}:
                 continue
 
             meta, _ = download_backup_meta_file(
                 storage=self.storage,
-                basebackup_path=os.path.join(self.site_config["prefix"], "basebackup", backup["name"]),
-                metadata=backup["metadata"],
+                basebackup_path=os.path.join(self.site_config["prefix"], "basebackup", backup_data["name"]),
+                metadata=backup_data["metadata"],
                 key_lookup=lambda key_id: self.site_config["encryption_keys"][key_id]["private"],
                 extract_meta_func=extract_pghoard_delta_metadata
             )

@@ -24,10 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event
-from typing import Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import psycopg2
-from rohmu import dates, get_transfer, rohmufile
+from rohmu import BaseTransfer, dates, get_transfer, rohmufile
 from rohmu.dates import now as utc_now
 from rohmu.errors import (FileNotFoundFromStorageError, InvalidConfigurationError)
 from rohmu.inotify import InotifyWatcher
@@ -42,6 +42,7 @@ from pghoard.common import (
 from pghoard.compressor import (
     CompressionEvent, CompressionQueue, CompressorThread, WALFileDeleterThread, WalFileDeletionEvent, WalFileDeletionQueue
 )
+from pghoard.object_store import BaseBackupInfo
 from pghoard.preservation_request import (
     is_basebackup_preserved, parse_preservation_requests, patch_basebackup_metadata_with_preservation
 )
@@ -207,7 +208,7 @@ class PGHoard:
             return False
         return True
 
-    def create_basebackup(self, site, connection_info, basebackup_path, callback_queue=None, metadata=None):
+    def create_basebackup(self, site, connection_info, basebackup_path, callback_queue, metadata=None):
         if self.metrics:
             self.metrics.gauge("pghoard.backup_stream.basebackup_requested", 1, tags={"site": site})
 
@@ -324,41 +325,78 @@ class PGHoard:
 
         return backup_site_paths
 
-    def delete_remote_wal_before(self, wal_segment, site, pg_version):
-        self.log.info("Starting WAL deletion from: %r before: %r, pg_version: %r", site, wal_segment, pg_version)
-        storage = self.site_transfers.get(site)
+    def delete_remote_wal_before(self, wal_segment: str, sites: List[str], pg_version: int) -> None:
+        """
+        Delete remote WAL segments older than the given WAL segment across multiple object storage sites.
+
+        The function walks backwards (in decreasing order) from the WAL segment immediately preceding ``wal_segment``
+        and attempts to delete each segment from the configured sites.
+
+        To reduce unnecessary delete calls (which may be expensive in object storage), the function rotates the site
+        list so that the site that last successfully deleted a WAL segment is tried first on subsequent iterations.
+        """
+        self.log.info("Starting WAL deletion from: %r before: %r, pg_version: %r", sites, wal_segment, pg_version)
+
         valid_timeline = True
         lsn = wal.LSN.from_walfile_name(wal_segment, server_version=pg_version)
+
+        preferred_site_idx = 0
         while True:
             if valid_timeline:
                 # Decrement one segment if we're on a valid timeline
                 lsn = lsn.previous_walfile_start_lsn
                 if lsn is None:
                     break
-            wal_path = os.path.join(self._get_site_prefix(site), "xlog", lsn.walfile_name)
-            self.log.debug("Deleting wal_file: %r", wal_path)
-            try:
-                storage.delete_key(wal_path)
-                valid_timeline = True
-            except FileNotFoundFromStorageError:
-                if not valid_timeline or lsn.timeline_id <= 1:
-                    # if we didn't find any WALs to delete on this timeline or we're already at
-                    # timeline 1 there's no need or possibility to try older timelines, break.
-                    self.log.info("Could not delete wal_file: %r, returning", wal_path)
-                    break
-                # let's try the same segment number on a previous timeline, but flag that timeline
-                # as "invalid" until we're able to delete at least one segment on it.
-                valid_timeline = False
-                lsn = lsn.at_timeline(lsn.timeline_id - 1)
-                self.log.info(
-                    "Could not delete wal_file: %r, trying the same segment on a previous "
-                    "timeline (%s)", wal_path, lsn.walfile_name
-                )
-            except Exception as ex:  # FIXME: don't catch all exceptions; pylint: disable=broad-except
-                self.log.exception("Problem deleting: %r", wal_path)
-                self.metrics.unexpected_exception(ex, where="delete_remote_wal_before")
 
-    def _get_delta_basebackup_files(self, site, storage, metadata, basebackup_name_to_delete, backups_to_keep) -> List:
+            # example:
+            # sites = [site1, site2, site3, site4] , preferred_site_idx = 2
+            # ordered_sites = [site3, site4, site1, site2]
+            ordered_sites = sites[preferred_site_idx:] + sites[:preferred_site_idx]
+            deleted = False
+            current_walfile_name = lsn.walfile_name
+            for idx, site in enumerate(ordered_sites):
+                storage = self.site_transfers.get(site)
+                wal_path = os.path.join(self._get_site_prefix(site), "xlog", current_walfile_name)
+                self.log.debug("Deleting wal_file: %r", wal_path)
+                try:
+                    storage.delete_key(wal_path)
+                    valid_timeline = True
+                    deleted = True
+                    # keep the index of the latest succesful deletion's site
+                    preferred_site_idx = idx
+                except FileNotFoundFromStorageError:
+                    continue
+                except Exception as ex:  # FIXME: don't catch all exceptions; pylint: disable=broad-except
+                    self.log.exception("Problem deleting: %r", wal_path)
+                    if self.metrics:
+                        self.metrics.unexpected_exception(ex, where="delete_remote_wal_before")
+
+            if deleted:
+                continue
+
+            if not valid_timeline or lsn.timeline_id <= 1:
+                # if we didn't find any WALs to delete on this timeline or we're already at
+                # timeline 1 there's no need or possibility to try older timelines, break.
+                self.log.info("Could not delete wal_file: %r, returning", current_walfile_name)
+                break
+
+            # let's try the same segment number on a previous timeline, but flag that timeline
+            # as "invalid" until we're able to delete at least one segment on it.
+            valid_timeline = False
+            lsn = lsn.at_timeline(lsn.timeline_id - 1)
+            self.log.info(
+                "Could not delete wal_file: %r, trying the same segment on a previous "
+                "timeline (%s)", current_walfile_name, lsn.walfile_name
+            )
+
+    def _get_delta_basebackup_files(
+        self,
+        site: str,
+        storage: BaseTransfer,
+        metadata: Dict[str, Any],
+        basebackup_name_to_delete: str,
+        backups_to_keep: List[BaseBackupInfo],
+    ) -> List[str]:
         delta_formats = (BaseBackupFormat.delta_v1, BaseBackupFormat.delta_v2)
         assert metadata["format"] in delta_formats
         all_hexdigests = set()
@@ -366,9 +404,9 @@ class PGHoard:
 
         basebackup_data_files = list()
         delta_backup_names = {
-            backup["name"]: backup["metadata"]
+            backup.name: backup.data["metadata"]
             for backup in backups_to_keep
-            if backup["metadata"]["format"] in delta_formats
+            if backup.data["metadata"]["format"] in delta_formats
         }
         delta_backup_names[basebackup_name_to_delete] = metadata
 
@@ -410,7 +448,13 @@ class PGHoard:
 
         return basebackup_data_files
 
-    def delete_remote_basebackup(self, site, basebackup, metadata, basebackups):
+    def delete_remote_basebackup(
+        self,
+        site: str,
+        basebackup: str,
+        metadata: Dict[str, Any],
+        basebackups: List[BaseBackupInfo],
+    ) -> None:
         start_time = time.monotonic()
         storage = self.site_transfers.get(site)
         main_backup_key = os.path.join(self._get_site_prefix(site), "basebackup", basebackup)
@@ -444,13 +488,14 @@ class PGHoard:
                 self.log.info("Tried to delete non-existent basebackup %r", obj_key)
             except Exception as ex:  # FIXME: don't catch all exceptions; pylint: disable=broad-except
                 self.log.exception("Problem deleting: %r", obj_key)
-                self.metrics.unexpected_exception(ex, where="delete_remote_basebackup")
+                if self.metrics:
+                    self.metrics.unexpected_exception(ex, where="delete_remote_basebackup")
         self.log.info(
             "Deleted basebackup datafiles: %r, took: %.2fs", ", ".join(basebackup_data_files),
             time.monotonic() - start_time
         )
 
-    def get_or_create_site_storage(self, site):
+    def get_or_create_site_storage(self, site: str) -> BaseTransfer:
         storage = self.site_transfers.get(site)
         if not storage:
             storage_config = get_object_storage_config(self.config, site)
@@ -458,7 +503,7 @@ class PGHoard:
             self.site_transfers[site] = storage
         return storage
 
-    def get_remote_basebackups_info(self, site):
+    def get_remote_basebackups_info(self, site: str) -> List[BaseBackupInfo]:
         storage = self.get_or_create_site_storage(site=site)
         site_config = self.config["backup_sites"][site]
         results = storage.list_path(os.path.join(site_config["prefix"], "basebackup"))
@@ -471,7 +516,7 @@ class PGHoard:
             patch_basebackup_metadata_with_preservation(entry, backups_to_preserve)
 
         results.sort(key=lambda entry: entry["metadata"]["start-time"])
-        return results
+        return [BaseBackupInfo(name=result["name"], data=result, site=site) for result in results]
 
     def patch_basebackup_info(self, *, entry, site_config):
         # drop path from resulting list and convert timestamps
@@ -491,7 +536,12 @@ class PGHoard:
         if "normalized-backup-time" not in metadata:
             metadata["normalized-backup-time"] = self.get_normalized_backup_time(site_config, now=metadata["start-time"])
 
-    def determine_backups_to_delete(self, *, basebackups, site_config):
+    def determine_backups_to_delete(
+        self,
+        *,
+        basebackups: List[BaseBackupInfo],
+        site_config: Dict[str, Any],
+    ) -> List[BaseBackupInfo]:
         """Returns the basebackups in the given list that need to be deleted based on the given site configuration.
         Note that `basebackups` is edited in place: any basebackups that need to be deleted are removed from it."""
         allowed_basebackup_count = site_config["basebackup_count"]
@@ -501,12 +551,12 @@ class PGHoard:
         now = dates.now()
         basebackups_to_delete = []
         while len(basebackups) > allowed_basebackup_count:
-            if is_basebackup_preserved(basebackups[0], now):
-                self.log.info("Not deleting more backups because %r still needs to preserved", basebackups[0]["name"])
+            if is_basebackup_preserved(basebackups[0].data, now):
+                self.log.info("Not deleting more backups because %r still needs to preserved", basebackups[0].name)
                 break
             self.log.warning(
                 "Too many basebackups: %d > %d, %r, starting to get rid of %r", len(basebackups), allowed_basebackup_count,
-                basebackups, basebackups[0]["name"]
+                basebackups, basebackups[0].name
             )
             basebackups_to_delete.append(basebackups.pop(0))
 
@@ -517,19 +567,19 @@ class PGHoard:
         current_time = datetime.datetime.now(datetime.timezone.utc)
         if max_age_days and min_backups > 0:
             while basebackups and len(basebackups) > min_backups:
-                if is_basebackup_preserved(basebackups[0], now):
-                    self.log.info("Not deleting more backups because %r still needs to preserved", basebackups[0]["name"])
+                if is_basebackup_preserved(basebackups[0].data, now):
+                    self.log.info("Not deleting more backups because %r still needs to preserved", basebackups[0].name)
                     break
                 # For age checks we treat the age as current_time - (backup_start_time + backup_interval). So when
                 # backup interval is set to 24 hours a backup started 2.5 days ago would be considered to be 1.5 days old.
-                completed_at = basebackups[0]["metadata"]["start-time"] + backup_interval
+                completed_at = basebackups[0].data["metadata"]["start-time"] + backup_interval
                 backup_age = current_time - completed_at
                 # timedelta would have direct `days` attribute but that's an integer rounded down. We want a float
                 # so that we can react immediately when age is too old
                 backup_age_days = backup_age.total_seconds() / 60.0 / 60.0 / 24.0
                 if backup_age_days > max_age_days:
                     self.log.warning(
-                        "Basebackup %r too old: %.3f > %.3f, %r, starting to get rid of it", basebackups[0]["name"],
+                        "Basebackup %r too old: %.3f > %.3f, %r, starting to get rid of it", basebackups[0].name,
                         backup_age_days, max_age_days, basebackups
                     )
                     basebackups_to_delete.append(basebackups.pop(0))
@@ -547,24 +597,50 @@ class PGHoard:
         site_config = self.config["backup_sites"][site]
         # Never delete backups from a recovery site. This check is already elsewhere as well
         # but still check explicitly here to ensure we certainly won't delete anything unexpectedly
-        if site_config["active"]:
-            basebackups_to_delete = self.determine_backups_to_delete(basebackups=basebackups, site_config=site_config)
+        if not site_config["active"]:
+            self.state["backup_sites"][site]["basebackups"] = [bb.data for bb in basebackups]
+            return
 
-            for basebackup_to_be_deleted in basebackups_to_delete:
-                pg_version_str = basebackup_to_be_deleted["metadata"].get("pg-version")
-                pg_version = None if pg_version_str is None else int(pg_version_str)
-                last_wal_segment_still_needed = 0
-                if basebackups:
-                    last_wal_segment_still_needed = basebackups[0]["metadata"]["start-wal-segment"]
+        # Unify basebackups main site with its origin sites
+        chained_basebackups = basebackups
+        for prev_site in site_config.get("moved_from", []):
+            chained_basebackups.extend(self.get_remote_basebackups_info(prev_site))
+        chained_basebackups.sort(key=lambda entry: entry.data["metadata"]["start-time"])
 
-                if last_wal_segment_still_needed:
-                    # This is breaking concurrent PITR starting from the *previous* backup.
-                    # That's why once a backup is preserved, we keep that backup and all the next ones.
-                    self.delete_remote_wal_before(last_wal_segment_still_needed, site, pg_version)
-                self.delete_remote_basebackup(
-                    site, basebackup_to_be_deleted["name"], basebackup_to_be_deleted["metadata"], basebackups=basebackups
-                )
-        self.state["backup_sites"][site]["basebackups"] = basebackups
+        # consider the main site expiration config.
+        basebackups_to_delete = self.determine_backups_to_delete(basebackups=chained_basebackups, site_config=site_config)
+        for basebackup_to_be_deleted in basebackups_to_delete:
+            # basebackup info is patched with the actual site it's originated from
+            bb_tbd_site = basebackup_to_be_deleted.site
+
+            pg_version_str = basebackup_to_be_deleted.data["metadata"].get("pg-version")
+            pg_version = None if pg_version_str is None else int(pg_version_str)
+            last_wal_segment_still_needed = 0
+            if chained_basebackups:
+                last_wal_segment_still_needed = chained_basebackups[0].data["metadata"]["start-wal-segment"]
+            if last_wal_segment_still_needed:
+                # This is breaking concurrent PITR starting from the *previous* backup.
+                # That's why once a backup is preserved, we keep that backup and all the next ones.
+
+                # WALs before the latest WAL segment needed can be distributed in different sites. Starting from
+                # the site from the next backup after basebackups_to_delete till other previous sites.
+                sites_to_try_delete = [chained_basebackups[0].site]
+                sites_to_try_delete += [
+                    site_to_try for site_to_try in [bb_tbd_site] +
+                    self.config["backup_sites"][bb_tbd_site].get("moved_from", []) if site_to_try not in sites_to_try_delete
+                ]
+                self.delete_remote_wal_before(last_wal_segment_still_needed, sites_to_try_delete, pg_version)
+
+            self.delete_remote_basebackup(
+                bb_tbd_site,
+                basebackup_to_be_deleted.name,
+                basebackup_to_be_deleted.data["metadata"],
+                basebackups=chained_basebackups
+            )
+
+        all_chained_sites = [site] + site_config.get("moved_from", [])
+        for c_site in all_chained_sites:
+            self.state["backup_sites"][c_site]["basebackups"] = [bb.data for bb in chained_basebackups if bb.site == c_site]
 
     def get_normalized_backup_time(self, site_config, *, now=None):
         """Returns the closest historical backup time that current time matches to (or current time if it matches).
