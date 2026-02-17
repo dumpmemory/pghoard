@@ -18,10 +18,10 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import psycopg2
-from rohmu import dates, errors, rohmufile
+from rohmu import BaseTransfer, dates, errors, rohmufile
 # pylint: disable=superfluous-parens
 from rohmu.delta.common import BackupPath
 
@@ -29,14 +29,16 @@ from pghoard import common, version, wal
 from pghoard.basebackup.chunks import ChunkUploader, DeltaStats
 from pghoard.basebackup.delta import DeltaBaseBackup
 from pghoard.common import (
-    TAR_METADATA_FILENAME, BackupFailure, BaseBackupFormat, BaseBackupMode, CallbackEvent, CompressionData, EncryptionData,
-    FileType, NoException, PersistedProgress, PGHoardThread, connection_string_using_pgpass, download_backup_meta_file,
-    extract_pghoard_bb_v2_metadata, replication_connection_string_and_slot_using_pgpass, set_stream_nonblocking,
-    set_subprocess_stdout_and_stderr_nonblocking, terminate_subprocess
+    TAR_METADATA_FILENAME, BackupFailure, BaseBackupFormat, BaseBackupMode, CallbackEvent, CallbackQueue, CompressionData,
+    EncryptionData, FileType, NoException, PersistedProgress, PGHoardThread, connection_string_using_pgpass,
+    download_backup_meta_file, extract_pghoard_bb_v2_metadata, replication_connection_string_and_slot_using_pgpass,
+    set_stream_nonblocking, set_subprocess_stdout_and_stderr_nonblocking, terminate_subprocess
 )
-from pghoard.compressor import CompressionEvent
+from pghoard.compressor import CompressionEvent, CompressionQueue
+from pghoard.metrics import Metrics
+from pghoard.object_store import BaseBackupInfo
 from pghoard.pgutil import check_if_pg_connection_is_alive
-from pghoard.transfer import UploadEvent
+from pghoard.transfer import TransferQueue, UploadEvent
 
 BASEBACKUP_NAME = "pghoard_base_backup"
 EMPTY_DIRS = [
@@ -56,18 +58,19 @@ EMPTY_DIRS = [
 class PGBaseBackup(PGHoardThread):
     def __init__(
         self,
-        config,
-        site,
-        connection_info,
-        basebackup_path,
-        compression_queue,
-        metrics,
-        storage,
-        transfer_queue=None,
-        callback_queue=None,
-        pg_version_server=None,
-        metadata=None,
-        get_remote_basebackups_info=None
+        *,
+        config: Dict[str, Any],
+        site: str,
+        connection_info: Union[str, Dict[str, Any]],
+        basebackup_path: str,
+        callback_queue: CallbackQueue,
+        compression_queue: CompressionQueue,
+        transfer_queue: TransferQueue,
+        metrics: Metrics,
+        pg_version_server: int,
+        storage: BaseTransfer,
+        get_remote_basebackups_info: Callable[[str], List[BaseBackupInfo]],
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.log = logging.getLogger("PGBaseBackup")
@@ -511,13 +514,13 @@ class PGBaseBackup(PGHoardThread):
         hashes: Dict[str, int] = {}
 
         for backup in self.get_remote_basebackups_info(self.site):
-            if backup["metadata"].get("format") != BaseBackupFormat.v2:
+            if backup.data["metadata"].get("format") != BaseBackupFormat.v2:
                 continue
 
             meta, _ = download_backup_meta_file(
                 storage=self.storage,
-                basebackup_path=os.path.join(self.site_config["prefix"], "basebackup", backup["name"]),
-                metadata=backup["metadata"],
+                basebackup_path=os.path.join(self.site_config["prefix"], "basebackup", backup.name),
+                metadata=backup.data["metadata"],
                 key_lookup=lambda key_id: self.site_config["encryption_keys"][key_id]["private"],
                 extract_meta_func=extract_pghoard_bb_v2_metadata
             )

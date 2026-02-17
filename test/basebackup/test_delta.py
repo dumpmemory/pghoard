@@ -18,6 +18,7 @@ from pghoard.basebackup.chunks import ChunkUploader, HashFile
 from pghoard.basebackup.delta import DeltaBaseBackup, UploadedFilesMetric
 from pghoard.common import (BackupFailure, BaseBackupFormat, CallbackEvent, CallbackQueue, CompressionData, EncryptionData)
 from pghoard.metrics import Metrics
+from pghoard.object_store import BaseBackupInfo
 from pghoard.transfer import TransferQueue
 
 
@@ -175,33 +176,47 @@ def test_list_existing_files_skips_non_delta_formats(deltabasebackup: DeltaBaseB
     with patch.object(deltabasebackup, "get_remote_basebackups_info") as mock_get_remote_basebackups_info, \
             patch("pghoard.basebackup.delta.download_backup_meta_file", new=fake_download_backup_meta):
         mock_get_remote_basebackups_info.return_value = [
-            {
-                "metadata": {
+            BaseBackupInfo(
+                name="",
+                site=deltabasebackup.site,
+                data={"metadata": {
                     "format": BaseBackupFormat.v1
-                }
-            },
-            {
-                "metadata": {
+                }},
+            ),
+            BaseBackupInfo(
+                name="",
+                site=deltabasebackup.site,
+                data={"metadata": {
                     "format": BaseBackupFormat.v2
-                }
-            },
-            {
-                "metadata": {
-                    "format": BaseBackupFormat.delta_v1
+                }},
+            ),
+            BaseBackupInfo(
+                name="delta_v1",
+                site=deltabasebackup.site,
+                data={
+                    "metadata": {
+                        "format": BaseBackupFormat.delta_v1
+                    },
+                    "name": "delta_v1"
                 },
-                "name": "delta_v1"
-            },
-            {
-                "metadata": {
-                    "format": BaseBackupFormat.delta_v2
+            ),
+            BaseBackupInfo(
+                name="delta_v2",
+                site=deltabasebackup.site,
+                data={
+                    "metadata": {
+                        "format": BaseBackupFormat.delta_v2
+                    },
+                    "name": "delta_v2"
                 },
-                "name": "delta_v2"
-            },
-            {
-                "metadata": {
+            ),
+            BaseBackupInfo(
+                name="basebackup_4",
+                site=deltabasebackup.site,
+                data={"metadata": {
                     "format": "unknown"
-                }
-            },
+                }},
+            ),
         ]
         assert deltabasebackup._list_existing_files() == {  # pylint: disable=protected-access
             "delta1hex1": SnapshotFile(
