@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from pghoard.common import TAR_METADATA_FILENAME, write_json_file
+from pghoard.object_store import BaseBackupInfoFromBucket
 from pghoard.restore import (
     STALL_MIN_RETRIES, BasebackupFetcher, ChunkFetcher, FileDataInfo, FileInfoType, FilePathInfo, Restore, RestoreError,
     create_recovery_conf
@@ -76,24 +77,34 @@ class TestRecoveryConf(PGHoardTestCase):
         r = Restore()
         r.storage = Mock()
         basebackups = [
-            {
-                "name": "2015-02-12_0",
-                "size": 42,
-                "metadata": {
-                    "start-time": "2015-02-12T14:07:19+00:00"
+            BaseBackupInfoFromBucket(
+                name="2015-02-12_0",
+                data={
+                    "size": 42,
+                    "metadata": {
+                        "start-time": "2015-02-12T14:07:19+00:00"
+                    }
                 },
-            },
-            {
-                "name": "2015-02-13_0",
-                "size": 42 * 1024 * 1024,
-                "metadata": {
-                    "start-time": "2015-02-13T14:07:19+00:00"
+                site="",
+                storage=Mock(),
+                prefix=""
+            ),
+            BaseBackupInfoFromBucket(
+                name="2015-02-13_0",
+                data={
+                    "size": 42 * 1024 * 1024,
+                    "metadata": {
+                        "start-time": "2015-02-13T14:07:19+00:00"
+                    },
                 },
-            },
+                site="",
+                storage=Mock(),
+                prefix=""
+            ),
         ]
 
         r.storage.list_basebackups = Mock(return_value=basebackups)
-        assert r._find_nearest_basebackup()["name"] == "2015-02-13_0"  # pylint: disable=protected-access
+        assert r._find_nearest_basebackup().name == "2015-02-13_0"  # pylint: disable=protected-access
         recovery_time = datetime.datetime(2015, 2, 1)
         recovery_time = recovery_time.replace(tzinfo=datetime.timezone.utc)
         with pytest.raises(RestoreError):
@@ -101,12 +112,12 @@ class TestRecoveryConf(PGHoardTestCase):
 
         recovery_time = datetime.datetime(2015, 2, 12, 14, 20)
         recovery_time = recovery_time.replace(tzinfo=datetime.timezone.utc)
-        assert r._find_nearest_basebackup(recovery_time)["name"] == "2015-02-12_0"  # pylint: disable=protected-access
+        assert r._find_nearest_basebackup(recovery_time).name == "2015-02-12_0"  # pylint: disable=protected-access
 
         # for each basebackup, make sure we find it when asking for its exact time
         for basebackup in basebackups:
-            recovery_time = datetime.datetime.fromisoformat(basebackup["metadata"]["start-time"])
-            assert r._find_nearest_basebackup(recovery_time)["name"] == basebackup["name"]  # pylint: disable=protected-access
+            recovery_time = datetime.datetime.fromisoformat(basebackup.data["metadata"]["start-time"])
+            assert r._find_nearest_basebackup(recovery_time).name == basebackup.name  # pylint: disable=protected-access
 
     def test_compatible_cli_args(self):
         parser = Restore().create_parser()
@@ -575,11 +586,12 @@ def test_restore_get_delta_basebackup_data():
             },
         },
     }
-    r.storage = Mock()
-    r.storage.storage.get_contents_to_string.return_value = (data, {})
+    storage = Mock()
+    storage.get_contents_to_string.return_value = (data, {})
     file_metadata = {"compression-algorithm": "snappy", "format": "pghoard-delta-v2"}
+    basebackup = BaseBackupInfoFromBucket(site="test", name="delta_backup1", prefix="abc/def", storage=storage, data={})
     tablespaces, files, empty_dirs = r._get_delta_basebackup_data(  # pylint: disable=protected-access
-        site="test", metadata=file_metadata, basebackup_name="delta_backup1"
+        basebackup=basebackup, metadata=file_metadata
     )
     assert tablespaces == {"foo": {"oid": 1234, "path": "/tmp/test_restore2"}}
     assert empty_dirs == ["base/dir1"]

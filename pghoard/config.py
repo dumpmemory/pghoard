@@ -8,7 +8,7 @@ import json
 import multiprocessing
 import os
 import subprocess
-from typing import Optional
+from typing import Any, Optional
 
 from rohmu import get_class_for_transfer
 from rohmu.errors import InvalidConfigurationError
@@ -241,7 +241,7 @@ def read_json_config_file(filename, *, check_commands=True, add_defaults=True, c
     return set_and_check_config_defaults(config, check_commands=check_commands, check_pgdata=check_pgdata)
 
 
-def get_site_from_config(config, site):
+def get_site_from_config(config: dict[str, Any], site: str):
     if not config.get("backup_sites"):
         raise InvalidConfigurationError("No backup sites defined in configuration")
     site_count = len(config["backup_sites"])

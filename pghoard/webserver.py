@@ -510,11 +510,31 @@ class RequestHandler(BaseHTTPRequestHandler):
         xlog_path = Path(xlog_path_str)
         return xlog_path.is_file() and not xlog_path.is_symlink()
 
+    def get_related_sites(self, site: str) -> list[str]:
+        for site_id, backup_site in self.server.config["backup_sites"].items():
+            moved_from = backup_site.get("moved_from", [])
+            if site in moved_from:
+                return [site_id] + moved_from
+
+        sites = self.server.config["backup_sites"][site].get("moved_from", [])
+        return [site] + sites
+
     def get_wal_or_timeline_file(self, site: str, filename: str, filetype: str) -> None:
         target_path = self.headers.get("x-pghoard-target-path")
         if not target_path:
             raise HttpResponse("x-pghoard-target-path header missing from download", status=400)
+        for backup_site in self.get_related_sites(site):
+            # We are requesting wal from the site where the base backups is stored
+            # In case the service was relocated the WAL can be on different site
+            # for this reason we have to check on all sites if there is the WAL we are searching
+            try:
+                self.get_wal_or_timeline_file_for_site(backup_site, filename, filetype, target_path)
+            except HttpResponse as res:
+                if res.status != 404:
+                    raise
+        raise HttpResponse(status=404)
 
+    def get_wal_or_timeline_file_for_site(self, site: str, filename: str, filetype: str, target_path: str) -> None:
         site_config = self.server.config["backup_sites"][site]
         xlog_dir = get_pg_wal_directory(site_config)
 
@@ -598,8 +618,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         raise HttpResponse("TIMEOUT", status=500)
 
     def list_basebackups(self, site):
-        response = self._transfer_agent_op(site, "", "basebackup", TransferOperation.List)
-        raise HttpResponse({"basebackups": response.payload["items"]}, status=200)
+        basebackups = []
+        related_sites = self.get_related_sites(site)
+        for related_site in related_sites:
+            response = self._transfer_agent_op(related_site, "", "basebackup", TransferOperation.List)
+            basebackups += response.payload["items"]
+
+        raise HttpResponse({"basebackups": basebackups}, status=200)
 
     def handle_archival_request(self, site, filename, filetype):
         if filetype == "basebackup":
@@ -676,7 +701,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             site, obtype, obname = self._parse_request(path)
             if self.headers.get("x-pghoard-target-path"):
                 raise HttpResponse("x-pghoard-target-path header is only valid for downloads", status=400)
-            response = self._transfer_agent_op(site, obname, obtype, TransferOperation.Metadata)
+            related_sites = self.get_related_sites(site)
+            response = None
+            for related_site in related_sites:
+                try:
+                    response = self._transfer_agent_op(related_site, obname, obtype, TransferOperation.Metadata)
+                except HttpResponse as ex:
+                    if ex.status != 404:
+                        raise
+
+            if response is None:
+                raise HttpResponse(status=404)
+
             metadata = response.payload["metadata"]
             headers = {}
             if metadata.get("hash") and metadata.get("hash-algorithm"):

@@ -5,6 +5,7 @@ Copyright (c) 2015 Ohmu Ltd
 See LICENSE for details
 """
 import datetime
+import json
 import os
 import tarfile
 import time
@@ -13,24 +14,30 @@ from os import makedirs
 from queue import Queue
 from subprocess import check_call
 from typing import Any, Dict, Optional
+from unittest.mock import MagicMock
 
 import dateutil.parser
 import psycopg2
 import pytest
 from mock import ANY, Mock
 from mock.mock import patch
-from rohmu import dates, get_transfer
+from rohmu import BaseTransfer, dates, get_transfer
 
 from pghoard import common, metrics
 from pghoard.basebackup.base import PGBaseBackup
 from pghoard.common import (BackupReason, BaseBackupFormat, BaseBackupMode, CallbackEvent, CallbackQueue)
+from pghoard.compressor import CompressionQueue
+from pghoard.object_store import BaseBackupInfo, BucketObjectStore
 from pghoard.pghoard import DeltaBaseBackupFailureInfo
 from pghoard.restore import Restore, RestoreError
+from pghoard.transfer import TransferQueue
 
 from ..conftest import PGHoardForTest, PGTester
 from ..util import switch_wal
 
 Restore.log_tracebacks = True
+
+MockedBaseTransfer = MagicMock(spec=BaseTransfer)
 
 SIMPLE_BACKUP_CONFIG: Dict[str, Any] = {
     "backup_sites": {
@@ -45,6 +52,22 @@ SIMPLE_BACKUP_CONFIG: Dict[str, Any] = {
         "level": 10
     },
 }
+
+
+def _get_simple_pg_base_backup() -> PGBaseBackup:
+    return PGBaseBackup(
+        config=SIMPLE_BACKUP_CONFIG,
+        site="foosite",
+        connection_info={},
+        basebackup_path="",
+        compression_queue=CompressionQueue(),
+        storage=MockedBaseTransfer(),
+        transfer_queue=TransferQueue(),
+        metrics=metrics.Metrics(statsd={}),
+        callback_queue=CallbackQueue(),
+        pg_version_server=18_000,
+        get_remote_basebackups_info=lambda _: [],
+    )
 
 
 class TestPGBaseBackup:
@@ -64,16 +87,7 @@ LABEL: pg_basebackup base backup
 '''
                 )
             tfile.add(os.path.join(td, "backup_label"), arcname="backup_label")
-        pgb = PGBaseBackup(
-            config=SIMPLE_BACKUP_CONFIG,
-            site="foosite",
-            connection_info=None,
-            basebackup_path=None,
-            compression_queue=None,
-            storage=None,
-            transfer_queue=None,
-            metrics=metrics.Metrics(statsd={})
-        )
+        pgb = _get_simple_pg_base_backup()
         start_wal_segment, start_time = pgb.parse_backup_label_in_tar(fn)
         assert start_wal_segment == "000000010000000000000004"
         assert start_time == "2015-02-12T14:07:19+00:00"
@@ -95,16 +109,7 @@ LABEL: pg_basebackup base backup
                 s2.write("s2\n")
                 s3.write("s3\n")
 
-        pgb = PGBaseBackup(
-            config=SIMPLE_BACKUP_CONFIG,
-            site="foosite",
-            connection_info=None,
-            basebackup_path=None,
-            compression_queue=None,
-            storage=None,
-            transfer_queue=None,
-            metrics=metrics.Metrics(statsd={})
-        )
+        pgb = _get_simple_pg_base_backup()
         create_test_files()
         files = pgb.find_files_to_backup(pgdata=db.pgdata, tablespaces={})
         first_file = next(files)
@@ -190,16 +195,7 @@ LABEL: pg_basebackup base backup
         with open(os.path.join(sub, "f3"), "w") as f:
             f.write("a" * 50000)
 
-        pgb = PGBaseBackup(
-            config=SIMPLE_BACKUP_CONFIG,
-            site="foosite",
-            connection_info=None,
-            basebackup_path=None,
-            compression_queue=None,
-            storage=None,
-            transfer_queue=None,
-            metrics=metrics.Metrics(statsd={})
-        )
+        pgb = _get_simple_pg_base_backup()
         total_file_count, chunks = pgb.find_and_split_files_to_backup(
             pgdata=pgdata, tablespaces={}, target_chunk_size=110000
         )
@@ -327,22 +323,16 @@ LABEL: pg_basebackup base backup
 
         # there should only be a single backup so lets compare what was in the metadata with what
         # was in the backup label
-        storage_config = common.get_object_storage_config(pghoard.config, pghoard.test_site)
+
+        recover_sites = Restore().find_recovery_sites(pghoard.test_site, pghoard.config_path)
+        recover_site = BucketObjectStore(pghoard.config, recover_sites, None).list_basebackups()[0].site
+
+        storage_config = common.get_object_storage_config(pghoard.config, recover_site)
         storage = get_transfer(storage_config)
-        backups = storage.list_path(os.path.join(pghoard.config["backup_sites"][pghoard.test_site]["prefix"], "basebackup"))
+        backups = storage.list_path(os.path.join(pghoard.config["backup_sites"][recover_site]["prefix"], "basebackup"))
 
         # lets grab the backup label details for what we restored
-        pgb = PGBaseBackup(
-            config=SIMPLE_BACKUP_CONFIG,
-            site="foosite",
-            connection_info=None,
-            basebackup_path=None,
-            compression_queue=None,
-            storage=storage,
-            transfer_queue=None,
-            metrics=metrics.Metrics(statsd={})
-        )
-
+        pgb = _get_simple_pg_base_backup()
         path = os.path.join(backup_out, "backup_label")
         with open(path, "r") as myfile:
             data = myfile.read()
@@ -376,6 +366,29 @@ LABEL: pg_basebackup base backup
 
     def test_basebackups_basic(self, capsys, db, pghoard, tmpdir):
         self._test_basebackups(capsys, db, pghoard, tmpdir, BaseBackupMode.basic)
+
+    def change_to_new_storage_location(self, pghoard, new_site_name: str, tmpdir) -> None:
+        new_storage = deepcopy(pghoard.config["backup_sites"][pghoard.test_site])
+        new_storage["object_storage"]["directory"] = "/dev/null"
+        new_storage["moved_from"] = [pghoard.test_site]
+        pghoard.config["backup_sites"][new_site_name] = new_storage
+        pghoard.test_site = new_site_name
+
+        confpath = os.path.join(str(tmpdir), "config.json")
+        with open(confpath, "w") as fp:
+            json.dump(pghoard.config, fp)
+
+    def test_basebackups_can_restore_from_old_location(self, capsys, db, pghoard, tmpdir):
+        self._test_create_basebackup(capsys, db, pghoard, BaseBackupMode.basic, replica=False)
+
+        new_site_name = pghoard.test_site + "_new"
+        old_site_name = pghoard.test_site
+        self.change_to_new_storage_location(pghoard, new_site_name, tmpdir)
+
+        assert len(BucketObjectStore(pghoard.config, [new_site_name], None).list_basebackups()) == 0
+        assert len(BucketObjectStore(pghoard.config, [new_site_name, old_site_name], None).list_basebackups()) == 1
+
+        self._test_restore_basebackup(db, pghoard, tmpdir, BaseBackupMode.basic)
 
     def test_basebackups_basic_lzma(self, capsys, db, pghoard_lzma, tmpdir):
         self._test_basebackups(capsys, db, pghoard_lzma, tmpdir, BaseBackupMode.basic)
@@ -836,6 +849,42 @@ LABEL: pg_basebackup base backup
         assert metadata2["backup-decision-time"] == now3.isoformat()
         assert metadata2["normalized-backup-time"] == metadata["normalized-backup-time"]
 
+    def test_get_new_backup_details_finds_backup_from_old_site(self, pghoard):
+        """Test that get_new_backup_details considers backups from old site via moved_from."""
+        now = datetime.datetime.now(datetime.timezone.utc).replace(hour=15, minute=20, second=30, microsecond=0)
+
+        old_site = pghoard.test_site
+        new_site = pghoard.test_site + "_new"
+
+        pghoard.set_state_defaults(old_site)
+        old_site_config = pghoard.config["backup_sites"][old_site]
+        pghoard.state["backup_sites"][old_site]["basebackups"].append({
+            "metadata": {
+                "start-time": now - datetime.timedelta(hours=1),
+                "backup-decision-time": now - datetime.timedelta(hours=1),
+                "backup-reason": BackupReason.scheduled,
+                "normalized-backup-time": None,
+            },
+            "name": "old_site_backup_01",
+        })
+
+        new_site_config = deepcopy(old_site_config)
+        new_site_config["moved_from"] = [old_site]
+        new_site_config["basebackup_interval_hours"] = 24
+        pghoard.config["backup_sites"][new_site] = new_site_config
+        pghoard.set_state_defaults(new_site)
+
+        assert len(pghoard.state["backup_sites"][new_site]["basebackups"]) == 0
+
+        metadata = pghoard.get_new_backup_details(now=now, site=new_site, site_config=new_site_config)
+        assert metadata is None, "Should not trigger new backup when recent backup exists on old site"
+
+        new_site_config_no_moved_from = deepcopy(new_site_config)
+        del new_site_config_no_moved_from["moved_from"]
+        metadata = pghoard.get_new_backup_details(now=now, site=new_site, site_config=new_site_config_no_moved_from)
+        assert metadata is not None, "Should trigger new backup when moved_from is not configured"
+        assert metadata["backup-reason"] == BackupReason.scheduled
+
     def test_patch_basebackup_info(self, pghoard):
         now = datetime.datetime.now(datetime.timezone.utc)
         site_config = {
@@ -875,34 +924,13 @@ LABEL: pg_basebackup base backup
     def test_run_safe_unsupported_basebackup(self):
         config = SIMPLE_BACKUP_CONFIG.copy()
         config["backup_sites"]["foosite"]["basebackup_mode"] = "non-existing"
-        callback_queue = CallbackQueue()
-        callback_queue.put = Mock()
-        pgb = PGBaseBackup(
-            config=SIMPLE_BACKUP_CONFIG,
-            site="foosite",
-            connection_info=None,
-            callback_queue=callback_queue,
-            basebackup_path=None,
-            compression_queue=None,
-            storage=None,
-            transfer_queue=None,
-            metrics=metrics.Metrics(statsd={})
-        )
+        pgb = _get_simple_pg_base_backup()
+        pgb.callback_queue.put = Mock()
         pgb.run_safe()
-        callback_queue.put.assert_called_once_with(CallbackEvent(success=False, exception=ANY))
+        pgb.callback_queue.put.assert_called_once_with(CallbackEvent(success=False, exception=ANY))
 
-    def test_fetch_all_data_files_hashes(self):
-        pgb = PGBaseBackup(
-            config=SIMPLE_BACKUP_CONFIG,
-            site="foosite",
-            connection_info=None,
-            callback_queue=None,
-            basebackup_path=None,
-            compression_queue=None,
-            storage=None,
-            transfer_queue=None,
-            metrics=metrics.Metrics(statsd={})
-        )
+    def test_fetch_all_data_files_hashes(self, pghoard):
+        pgb = _get_simple_pg_base_backup()
 
         def fake_download_backup_meta_file(basebackup_path: str, **kwargs):  # pylint: disable=unused-argument
             meta = {}
@@ -933,13 +961,19 @@ LABEL: pg_basebackup base backup
 
         with patch.object(pgb, "get_remote_basebackups_info") as mock_get_remote_basebackups_info, \
                 patch("pghoard.basebackup.base.download_backup_meta_file", new=fake_download_backup_meta_file):
-            mock_get_remote_basebackups_info.return_value = [{
-                "name": f"backup{idx}",
-                "metadata": {
-                    "format": bb_format
-                }
-            } for idx, bb_format in enumerate([BaseBackupFormat.v1] + [BaseBackupFormat.v2] * 3 +
-                                              [BaseBackupFormat.delta_v1, BaseBackupFormat.delta_v2])]
+            mock_get_remote_basebackups_info.return_value = [
+                BaseBackupInfo(
+                    name=f"backup{idx}",
+                    site=pghoard.test_site,
+                    data={
+                        "name": f"backup{idx}",
+                        "metadata": {
+                            "format": bb_format
+                        }
+                    }
+                ) for idx, bb_format in enumerate([BaseBackupFormat.v1] + [BaseBackupFormat.v2] * 3 +
+                                                  [BaseBackupFormat.delta_v1, BaseBackupFormat.delta_v2])
+            ]
             res = pgb.fetch_all_data_files_hashes()
             assert res == {
                 "8ee55c458dde7fd7ea43b946dfb3c9713a360280ee2927e600b9d6d4630ef3fd": 1636,

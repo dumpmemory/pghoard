@@ -64,7 +64,7 @@ class PGHoardTestCase:
 
         # Instantiate a fake PG data directory
         pg_data_directory = os.path.join(str(self.temp_dir), "PG_DATA_DIRECTORY")
-        os.makedirs(pg_data_directory)
+        os.makedirs(pg_data_directory, exist_ok=True)
         open(os.path.join(pg_data_directory, "PG_VERSION"), "w").write(ver)
 
         config = {
@@ -93,6 +93,8 @@ class PGHoardTestCase:
                     config["backup_sites"][site_name].update(site_override)
                 else:
                     config["backup_sites"][site_name] = site_override
+
+                config["backup_sites"][site_name]["pg_data_directory"] = pg_data_directory
             config.update(override)
 
         os.makedirs(config["alert_file_dir"], exist_ok=True)

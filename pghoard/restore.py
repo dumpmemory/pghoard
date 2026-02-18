@@ -36,7 +36,9 @@ from pghoard.common import (
     TAR_METADATA_FILENAME, BaseBackupFormat, FileType, FileTypePrefixes, StrEnum, download_backup_meta_file,
     extract_pghoard_delta_metadata
 )
-from pghoard.object_store import (HTTPRestore, ObjectStore, print_basebackup_list)
+from pghoard.object_store import (
+    BaseBackupInfoFromBucket, BucketObjectStore, HTTPRestore, ObjectStore, print_basebackup_list
+)
 
 from . import common, config, logutil, version
 from .postgres_command import PGHOARD_HOST, PGHOARD_PORT
@@ -201,7 +203,7 @@ class Restore:
     def __init__(self):
         self.config = None
         self.log = logging.getLogger("PGHoardRestore")
-        self.storage = None
+        self.storage: ObjectStore | None = None
 
     def create_parser(self):
         parser = argparse.ArgumentParser()
@@ -297,24 +299,23 @@ class Restore:
 
         return parser
 
+    def find_recovery_sites(self, site: str, config_file: str) -> list[str]:
+        self.config = config.read_json_config_file(config_file, check_commands=False, check_pgdata=False)
+        site = config.get_site_from_config(self.config, site)
+        moved_from = self.config.get("backup_sites", {}).get(site, {}).get("moved_from", []) if self.config else []
+        return [site] + moved_from
+
     def list_basebackups_http(self, arg):
         """List available basebackups from a HTTP source"""
-        self.storage = HTTPRestore(arg.host, arg.port, arg.site, username=arg.username, password=arg.password)
+        self.storage = HTTPRestore(arg.host, arg.port, [arg.site], username=arg.username, password=arg.password)
         self.storage.show_basebackup_list(verbose=arg.verbose)
 
-    def _get_site_prefix(self, site):
-        return self.config["backup_sites"][site]["prefix"]
-
-    def _get_object_storage(self, site, pgdata):
-        storage_config = common.get_object_storage_config(self.config, site)
-        storage = get_transfer(storage_config)
-        return ObjectStore(storage, self._get_site_prefix(site), site, pgdata)
+    def _get_object_storage(self, sites: list[str], pgdata: Any):
+        return BucketObjectStore(self.config, sites, pgdata)
 
     def list_basebackups(self, arg):
         """List basebackups from an object store"""
-        self.config = config.read_json_config_file(arg.config, check_commands=False, check_pgdata=False)
-        site = config.get_site_from_config(self.config, arg.site)
-        self.storage = self._get_object_storage(site, pgdata=None)
+        self.storage = self._get_object_storage(self.find_recovery_sites(arg.site, arg.config), pgdata=None)
         self.storage.show_basebackup_list(verbose=arg.verbose)
 
     def get_basebackup(self, arg):
@@ -327,14 +328,11 @@ class Restore:
             except ValueError:
                 raise RestoreError("Invalid tablespace mapping {!r}".format(arg.tablespace_dir))
 
-        self.config = config.read_json_config_file(arg.config, check_commands=False, check_pgdata=False)
-        site = config.get_site_from_config(self.config, arg.site)
         try:
-            self.storage = self._get_object_storage(site, arg.target_dir)
+            self.storage = self._get_object_storage(self.find_recovery_sites(arg.site, arg.config), arg.target_dir)
             self._get_basebackup(
                 pgdata=arg.target_dir,
                 basebackup=arg.basebackup,
-                site=site,
                 debug=arg.debug,
                 status_output_file=arg.status_output_file,
                 primary_conninfo=arg.primary_conninfo,
@@ -362,8 +360,8 @@ class Restore:
     def _find_basebackup_for_name(self, name):
         basebackups = self.storage.list_basebackups()
         for basebackup in basebackups:
-            if basebackup["name"] == name:
-                print("\nSelecting {!r} for restore".format(basebackup["name"]))
+            if basebackup.name == name:
+                print("\nSelecting {!r} for restore".format(basebackup.name))
                 return basebackup
 
         raise RestoreError("No applicable basebackup found, exiting")
@@ -376,10 +374,10 @@ class Restore:
             if recovery_target_time:
                 # We really need the backup end time here, but pg_basebackup based backup methods don't provide
                 # it for us currently, so fall back to using start-time.
-                if "end-time" in basebackup["metadata"]:
-                    backup_ts = dates.parse_timestamp(basebackup["metadata"]["end-time"])
+                if "end-time" in basebackup.data["metadata"]:
+                    backup_ts = dates.parse_timestamp(basebackup.data["metadata"]["end-time"])
                 else:
-                    backup_ts = dates.parse_timestamp(basebackup["metadata"]["start-time"])
+                    backup_ts = dates.parse_timestamp(basebackup.data["metadata"]["start-time"])
                 if backup_ts > recovery_target_time:
                     continue
             applicable_basebackups.append(basebackup)
@@ -388,22 +386,22 @@ class Restore:
             raise RestoreError("No applicable basebackups found, exiting")
 
         # NOTE: as above, we may not have end-time so just sort by start-time, the order should be the same
-        applicable_basebackups.sort(key=lambda basebackup: basebackup["metadata"]["start-time"])
+        applicable_basebackups.sort(key=lambda basebackup: basebackup.data["metadata"]["start-time"])
         caption = "Found {} applicable basebackup{}".format(
             len(applicable_basebackups), "" if len(applicable_basebackups) == 1 else "s"
         )
         print_basebackup_list(applicable_basebackups, caption=caption)
 
         selected = applicable_basebackups[-1]
-        print("\nSelecting {!r} for restore".format(selected["name"]))
+        print("\nSelecting {!r} for restore".format(selected.name))
         return selected
 
-    def _get_delta_basebackup_data(self, site: str, metadata: Dict[str, Any], basebackup_name: str):
+    def _get_delta_basebackup_data(self, metadata: Dict[str, Any], basebackup: BaseBackupInfoFromBucket):
         bmeta, bmeta_compressed = download_backup_meta_file(
-            storage=self.storage.storage,
-            basebackup_path=basebackup_name,
+            storage=basebackup.storage,
+            basebackup_path=basebackup.name,
             metadata=metadata,
-            key_lookup=config.key_lookup_for_site(self.config, site),
+            key_lookup=config.key_lookup_for_site(self.config, basebackup.site),
             extract_meta_func=extract_pghoard_delta_metadata
         )
         self.log.debug("Delta backup metadata: %r", bmeta)
@@ -411,7 +409,7 @@ class Restore:
         basebackup_data_files: List[Union[FilePathInfo, FileDataInfo]] = [
             FilePathInfo(
                 name=os.path.join(
-                    self._get_site_prefix(site), FileTypePrefixes[FileType.Basebackup_delta_chunk], chunk["chunk_filename"]
+                    basebackup.prefix, FileTypePrefixes[FileType.Basebackup_delta_chunk], chunk["chunk_filename"]
                 ),
                 size=chunk["result_size"]
             ) for chunk in bmeta.get("chunks", [])
@@ -420,7 +418,7 @@ class Restore:
         # We need the files from the main basebackup file too
         basebackup_data_files.append(FileDataInfo(data=bmeta_compressed, metadata=metadata, size=0))
 
-        delta_objects_path = os.path.join(self._get_site_prefix(site), "basebackup_delta")
+        delta_objects_path = os.path.join(basebackup.prefix, "basebackup_delta")
 
         manifest = bmeta["manifest"]
         snapshot_result = manifest["snapshot_result"]
@@ -456,7 +454,6 @@ class Restore:
         self,
         pgdata,
         basebackup,
-        site,
         debug=False,
         status_output_file=None,
         primary_conninfo=None,
@@ -493,14 +490,14 @@ class Restore:
             basebackup = self._find_basebackup_for_name(basebackup)
 
         # Grab basebackup metadata to make sure it exists and to look up tablespace requirements
-        metadata = self.storage.get_basebackup_metadata(basebackup["name"])
+        metadata = basebackup.get_basebackup_metadata()
         tablespaces = {}
 
         # If requested, mark the backup for preservation
         preserve_request: Optional[str] = None
         if preserve_until is not None:
             preserve_until_datetime = dates.parse_timestamp(preserve_until)
-            preserve_request = self.storage.try_request_backup_preservation(basebackup["name"], preserve_until_datetime)
+            preserve_request = basebackup.try_request_backup_preservation(preserve_until_datetime)
 
         # Make sure we have a proper place to write the $PGDATA and possible tablespaces
         dirs_to_create = []
@@ -524,11 +521,11 @@ class Restore:
         basebackup_data_files: List[FileInfo] = []
         if metadata.get("format") == BaseBackupFormat.v2:
             # "Backup file" is a metadata object, fetch it to get more information
-            bmeta_compressed = self.storage.get_file_bytes(basebackup["name"])
+            bmeta_compressed = basebackup.get_file_bytes()
             with rohmufile.file_reader(
                 fileobj=io.BytesIO(bmeta_compressed),
                 metadata=metadata,
-                key_lookup=config.key_lookup_for_site(self.config, site)
+                key_lookup=config.key_lookup_for_site(self.config, basebackup.site)
             ) as input_obj:
                 bmeta = common.extract_pghoard_bb_v2_metadata(input_obj)
             self.log.debug("Backup metadata: %r", bmeta)
@@ -536,7 +533,7 @@ class Restore:
             tablespaces = bmeta["tablespaces"]
             basebackup_data_files = [
                 FilePathInfo(
-                    name=os.path.join(self._get_site_prefix(site), "basebackup_chunk", chunk["chunk_filename"]),
+                    name=os.path.join(basebackup.prefix, "basebackup_chunk", chunk["chunk_filename"]),
                     size=chunk["result_size"]
                 ) for chunk in bmeta["chunks"]
             ]
@@ -558,15 +555,13 @@ class Restore:
                     "path": tspath,
                 }
 
-            basebackup_data_files = [FilePathInfo(name=basebackup["name"], size=basebackup["size"])]
+            basebackup_data_files = [FilePathInfo(name=basebackup.name, size=basebackup.data["size"])]
 
         elif metadata.get("format") in {BaseBackupFormat.delta_v1, BaseBackupFormat.delta_v2}:
-            tablespaces, basebackup_data_files, empty_dirs = self._get_delta_basebackup_data(
-                site, metadata, basebackup["name"]
-            )
+            tablespaces, basebackup_data_files, empty_dirs = self._get_delta_basebackup_data(metadata, basebackup)
         else:
             # Object is a raw (encrypted, compressed) basebackup
-            basebackup_data_files = [FilePathInfo(name=basebackup["name"], size=basebackup["size"])]
+            basebackup_data_files = [FilePathInfo(name=basebackup.name, size=basebackup.data["size"])]
 
         if tablespace_base_dir and not os.path.exists(tablespace_base_dir) and not overwrite:
             # we just care that the dir exists, but we're OK if there are other objects there
@@ -628,7 +623,7 @@ class Restore:
             status_output_file=status_output_file,
             debug=debug,
             pgdata=pgdata,
-            site=site,
+            site=basebackup.site,
             tablespaces=tablespaces,
             stall_max_retries=stall_max_retries,
         )
@@ -636,7 +631,7 @@ class Restore:
 
         create_recovery_conf(
             dirpath=pgdata,
-            site=site,
+            site=basebackup.site,
             pghoard_postgres_command_bin=pghoard_postgres_command_bin,
             port=self.config["http_port"],
             webserver_username=self.config.get("webserver_username"),
@@ -653,7 +648,7 @@ class Restore:
         if preserve_request is not None and cancel_preserve_on_success:
             # This is intentionally not done if pghoard fails earlier with an exception,
             # we only cancel the preservation if the backup was successfully restored.
-            self.storage.try_cancel_backup_preservation(preserve_request)
+            basebackup.try_cancel_backup_preservation(preserve_request)
 
         print("Basebackup restoration complete.")
         print("You can start PostgreSQL by running pg_ctl -D %s start" % pgdata)

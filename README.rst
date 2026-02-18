@@ -733,6 +733,10 @@ configuration directive is specified, you must also define the public key
 for storing as well as private key for retrieving stored backups. These
 keys are specified with ``encryption_keys`` dictionary.
 
+``moved_from`` (no default)
+By default pghoard can recover backups from the same location,
+here you can specify additional backup recovery locations.
+
 ``encryption_keys`` (no default)
 
 This key is a mapping from key id to keys. Keys in turn are mapping from

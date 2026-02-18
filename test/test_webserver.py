@@ -12,6 +12,7 @@ import socket
 import threading
 import time
 from collections import deque
+from copy import deepcopy
 from http.client import HTTPConnection
 from queue import Queue
 from unittest import mock
@@ -38,7 +39,7 @@ from .test_wal import wal_header_for_file
 @pytest.fixture
 def http_restore(pghoard):
     pgdata = get_pg_wal_directory(pghoard.config["backup_sites"][pghoard.test_site])
-    return HTTPRestore("localhost", pghoard.config["http_port"], site=pghoard.test_site, pgdata=pgdata)
+    return HTTPRestore("localhost", pghoard.config["http_port"], sites=[pghoard.test_site], pgdata=pgdata)
 
 
 @pytest.fixture
@@ -47,7 +48,7 @@ def http_restore_with_userauth(pghoard_with_userauth):
     return HTTPRestore(
         "localhost",
         pghoard_with_userauth.config["http_port"],
-        site=pghoard_with_userauth.test_site,
+        sites=[pghoard_with_userauth.test_site],
         pgdata=pgdata,
         username=pghoard_with_userauth.config["webserver_username"],
         password=pghoard_with_userauth.config["webserver_password"]
@@ -152,13 +153,13 @@ class TestWebServer:
         final_location = self._run_and_wait_basebackup(pghoard, db, "pipe")
         backups = http_restore.list_basebackups()
         assert len(backups) == 1
-        assert backups[0]["size"] > 0
-        assert backups[0]["name"] == os.path.join(pghoard.test_site, "basebackup", os.path.basename(final_location))
+        assert backups[0].data["size"] > 0
+        assert backups[0].name == os.path.join(pghoard.test_site, "basebackup", os.path.basename(final_location))
         # make sure they show up on the printable listing, too
         http_restore.show_basebackup_list()
         out, _ = capsys.readouterr()
-        assert "{} MB".format(int(backups[0]["metadata"]["original-file-size"]) // (1024 ** 2)) in out
-        assert backups[0]["name"] in out
+        assert "{} MB".format(int(backups[0].data["metadata"]["original-file-size"]) // (1024 ** 2)) in out
+        assert backups[0].name in out
 
     def test_wal_fetch_optimization(self, pghoard):
         # inject fake WAL and timeline files for testing
@@ -746,6 +747,47 @@ class TestWebServer:
             restored_data = fp.read()
         assert content == restored_data
 
+    def test_get_wal_from_different_sites(self, pghoard):
+        """Test that WAL can be retrieved from old site when querying through new site.
+
+        This tests the multi-site WAL retrieval functionality where a service
+        has been migrated to a new site but WAL files still exist on the old site.
+        """
+        old_site = pghoard.test_site
+        new_site = pghoard.test_site + "_migrated"
+
+        wal_seg_prev_tli = "00000001000000000000000F"
+        wal_seg = "00000002000000000000000F"
+        wal_file = "xlog/{}".format(wal_seg)
+        # NOTE: create WAL header for the "previous" timeline, this should be accepted
+        content = wal_header_for_file(wal_seg_prev_tli)
+        wal_dir = get_pg_wal_directory(pghoard.config["backup_sites"][pghoard.test_site])
+        archive_path = os.path.join(pghoard.test_site, wal_file)
+        compressor = pghoard.Compressor()
+        compressed_content = compressor.compress(content) + (compressor.flush() or b"")
+        metadata = {
+            "compression-algorithm": pghoard.config["compression"]["algorithm"],
+            "original-file-size": len(content),
+        }
+        store = pghoard.transfer_agents[0].get_object_storage(pghoard.test_site)
+        store.store_file_from_memory(archive_path, compressed_content, metadata=metadata)
+
+        new_site_config = deepcopy(pghoard.config["backup_sites"][old_site])
+        new_site_config["moved_from"] = [old_site]
+        pghoard.config["backup_sites"][new_site] = new_site_config
+
+        pghoard.webserver.config = pghoard.config
+
+        restore_target = os.path.join(wal_dir, wal_seg)
+
+        restore_command(
+            site=new_site, xlog=wal_seg, output=restore_target, host="127.0.0.1", port=pghoard.config["http_port"]
+        )
+        assert os.path.exists(restore_target) is True
+        with open(restore_target, "rb") as fp:
+            restored_data = fp.read()
+        assert content == restored_data
+
     def test_requesting_basebackup(self, pghoard):
         nonexistent_basebackup = "/{}/archive/basebackup".format(pghoard.test_site)
         conn = HTTPConnection(host="127.0.0.1", port=pghoard.config["http_port"])
@@ -844,15 +886,15 @@ class TestWebServer:
         final_location = self._run_and_wait_basebackup(pghoard_with_userauth, db, "pipe")
         backups = http_restore_with_userauth.list_basebackups()
         assert len(backups) == 1
-        assert backups[0]["size"] > 0
-        assert backups[0]["name"] == os.path.join(
+        assert backups[0].data["size"] > 0
+        assert backups[0].name == os.path.join(
             pghoard_with_userauth.test_site, "basebackup", os.path.basename(final_location)
         )
         # make sure they show up on the printable listing, too
         http_restore_with_userauth.show_basebackup_list()
         out, _ = capsys.readouterr()
-        assert "{} MB".format(int(backups[0]["metadata"]["original-file-size"]) // (1024 ** 2)) in out
-        assert backups[0]["name"] in out
+        assert "{} MB".format(int(backups[0].data["metadata"]["original-file-size"]) // (1024 ** 2)) in out
+        assert backups[0].name in out
 
 
 @pytest.fixture(name="download_results_processor")

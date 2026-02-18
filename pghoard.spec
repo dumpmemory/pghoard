@@ -45,7 +45,6 @@ go build golang/pghoard_postgres_command_go.go
 
 
 %install
-sed -e s,pghoard_postgres_command,pghoard_postgres_command_go,g -i pghoard/restore.py
 python3 setup.py install --prefix=%{_prefix} --root=%{buildroot}
 sed -e "s@#!/bin/python@#!%{_bindir}/python@" -i %{buildroot}%{_bindir}/*
 %{__install} -Dm0644 pghoard.unit %{buildroot}%{_unitdir}/pghoard.service
