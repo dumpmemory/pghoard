@@ -103,6 +103,9 @@ class PGBaseBackup(PGHoardThread):
             transfer_queue=transfer_queue
         )
 
+    def update_storage(self, storage: BaseTransfer) -> None:
+        self.storage = storage
+
     def cancel(self) -> None:
         self.running = False
         db_conn = self._db_conn
@@ -585,7 +588,7 @@ class PGBaseBackup(PGHoardThread):
 
                 if delta:
                     delta_backup = DeltaBaseBackup(
-                        storage=self.storage,
+                        storage_getter=lambda: self.storage,
                         site=self.site,
                         site_config=self.site_config,
                         transfer_queue=self.transfer_queue,

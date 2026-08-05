@@ -58,7 +58,7 @@ class DeltaBaseBackup:
     def __init__(
         self,
         *,
-        storage: BaseTransfer,
+        storage_getter: Callable[[], BaseTransfer],
         site: str,
         site_config: Dict[str, Any],
         transfer_queue: TransferQueue,
@@ -73,7 +73,7 @@ class DeltaBaseBackup:
         data_file_format: Callable[[int], str],
     ):
         self.log = logging.getLogger("DeltaBaseBackup")
-        self.storage = storage
+        self.storage_getter = storage_getter
         self.site = site
         self.site_config = site_config
         self.transfer_queue = transfer_queue
@@ -135,7 +135,7 @@ class DeltaBaseBackup:
                 continue
 
             meta, _ = download_backup_meta_file(
-                storage=self.storage,
+                storage=self.storage_getter(),
                 basebackup_path=os.path.join(self.site_config["prefix"], "basebackup", backup_data["name"]),
                 metadata=backup_data["metadata"],
                 key_lookup=lambda key_id: self.site_config["encryption_keys"][key_id]["private"],
@@ -335,7 +335,7 @@ class DeltaBaseBackup:
                         key = os.path.join(self.site_config["prefix"], FileTypePrefixes[FileType.Basebackup_delta], new_hash)
                         self.log.info("Removing object from the storage: %r", key)
                         try:
-                            self.storage.delete_key(key)
+                            self.storage_getter().delete_key(key)
                         except FileNotFoundFromStorageError:
                             self.log.warning("Object with key %r does not exist, skipping", key)
 

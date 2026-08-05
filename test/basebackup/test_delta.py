@@ -87,7 +87,7 @@ def fixture_deltabasebackup(tmp_path: Path) -> DeltaBaseBackup:
     storage = Mock()
     data_file_format = "{}/{}.{{0:08d}}.pghoard".format(tmp_path, "test").format
     delta_base_backup = DeltaBaseBackup(
-        storage=storage,
+        storage_getter=lambda: storage,
         site="delta",
         site_config=site_config,
         transfer_queue=transfer_queue,
@@ -439,13 +439,13 @@ def test_upload_single_delta_files_cleanup_after_error(
         mock_delta_upload_hexdigest.return_value = (200, 10, file_hash, True)
 
         if not key_exists:
-            cast(Mock, deltabasebackup.storage.delete_key).side_effect = FileNotFoundFromStorageError
+            cast(Mock, deltabasebackup.storage_getter().delete_key).side_effect = FileNotFoundFromStorageError
 
         with snapshotter.lock:
             deltabasebackup._snapshot(snapshotter=snapshotter)  # pylint: disable=protected-access
             with pytest.raises(BackupFailure):
                 deltabasebackup._upload_single_delta_files(todo_hexdigests={file_hash}, snapshotter=snapshotter, progress=0)  # pylint: disable=protected-access
-            cast(Mock, deltabasebackup.storage.delete_key).assert_called_with(f"abc/basebackup_delta/{file_hash}")
+            cast(Mock, deltabasebackup.storage_getter().delete_key).assert_called_with(f"abc/basebackup_delta/{file_hash}")
 
 
 @pytest.mark.parametrize("files_count, initial_progress", [(1, 0), (4, 0), (10, 0), (1, 90), (15, 10)])

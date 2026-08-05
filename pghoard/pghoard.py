@@ -1078,6 +1078,11 @@ class PGHoard:
             thread.config = new_config
             thread.site_transfers = {}
 
+        for site, basebackup_thread in self.basebackups.items():
+            new_storage = self.get_or_create_site_storage(site=site)
+            basebackup_thread.update_storage(new_storage)
+            self.log.info("Updated storage credentials for basebackup thread for site %r", site)
+
         self.log.debug("Loaded config: %r from: %r", self.config, self.config_path)
 
     def _get_all_threads(self):
