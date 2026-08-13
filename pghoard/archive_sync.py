@@ -61,14 +61,15 @@ class ArchiveSync:
         pg_version = latest_basebackup["metadata"].get("pg-version")
         return latest_basebackup["metadata"]["start-wal-segment"], int(pg_version)
 
-    def archive_sync(self, verify, new_backup_on_failure, max_hash_checks):
-        self.check_and_upload_missing_local_files(max_hash_checks)
+    def archive_sync(self, verify, new_backup_on_failure, max_hash_checks, current_wal_file=None):
+        self.check_and_upload_missing_local_files(max_hash_checks, current_wal_file)
         if not verify:
             return None
         return self.check_wal_archive_integrity(new_backup_on_failure)
 
-    def check_and_upload_missing_local_files(self, max_hash_checks):
-        current_wal_file = self.get_current_wal_file()
+    def check_and_upload_missing_local_files(self, max_hash_checks, current_wal_file=None):
+        if current_wal_file is None:
+            current_wal_file = self.get_current_wal_file()
         first_required_wal_file, _ = self.get_first_required_wal_segment()
 
         # Find relevant WAL files.  We do this by checking archival status
@@ -234,6 +235,7 @@ class ArchiveSync:
         hash_check_help = "Maximum number of files for which to validate hash in addition to basic existence check"
         parser.add_argument("--max-hash-checks", help=hash_check_help, default=100)
         parser.add_argument("--no-verify", help="do not verify archive integrity", action="store_false")
+        parser.add_argument("--current-wal-file", help="Assume the current WAL instead of getting it from PG")
         parser.add_argument(
             "--create-new-backup-on-failure",
             help="request a new basebackup if verification fails",
@@ -248,7 +250,9 @@ class ArchiveSync:
 
         logutil.configure_logging(level=logging.DEBUG if args.debug else logging.INFO)
         self.set_config(args.config, args.site)
-        return self.archive_sync(args.no_verify, args.create_new_backup_on_failure, args.max_hash_checks)
+        return self.archive_sync(
+            args.no_verify, args.create_new_backup_on_failure, args.max_hash_checks, args.current_wal_file
+        )
 
 
 def main():
